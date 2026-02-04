@@ -39,27 +39,103 @@ def _extract_bolt_size_area(xls: pd.ExcelFile) -> pd.DataFrame:
               .drop_duplicates()
               .sort_values("bolt_size_in"))
 
-def _extract_materials(xls: pd.ExcelFile) -> pd.DataFrame:
-    sn = _find_sheet_containing(xls, "Bolt Material")
-    if sn is None:
-        raise RuntimeError("Missing 'Bolt Material' section.")
-    raw = pd.read_excel(xls, sheet_name=sn, header=None, engine="openpyxl")
+def _extract_materials(xls: pd.ExcelFile, sheet_hint: Optional[str] = None) -> pd.DataFrame:
+    """
+    Returns a normalized table with columns:
+      material (str), size_rule (str|None), yield_ksi (float)
+    Robust to multi-row headers and MPa/ksi units.
+    """
+    import re
+    candidates = xls.sheet_names if sheet_hint is None else [sheet_hint]
+
+    # Helpers
+    def _first_match_idx(cols, patterns):
+        for i, c in enumerate(cols):
+            s = str(c).strip().lower()
+            if any(re.search(p, s) for p in patterns):
+                return i
+        return None
+
+    def _coerce_yield_to_ksi(val):
+        # val could be "620 MPa", "85 ksi", 620, etc.
+        if pd.isna(val):
+            return None
+        s = str(val).strip().lower()
+        # extract number
+        m = re.search(r"([-+]?\d*\.?\d+)", s)
+        if not m:
+            return None
+        num = float(m.group(1))
+        # unit inference
+        if "mpa" in s:
+            return num / 6.89475729  # MPa -> ksi
+        if "ksi" in s:
+            return num
+        # Heuristic: if it's > 300, probably MPa; else ksi
+        return num / 6.89475729 if num > 300 else num
+
     recs = []
-    for _, row in raw.iterrows():
-        vals = [None if pd.isna(v) else v for v in row.tolist()]
-        if len(vals) < 3:
-            continue
+
+    for sn in candidates:
         try:
-            y = float(vals[-1])
-            mat = str(vals[0]).strip()
-            size = str(vals[1]).strip()
-            if mat and y > 0:
-                recs.append((mat, size, y))
+            # Read a decent chunk; headers may be several rows down
+            raw = pd.read_excel(xls, sheet_name=sn, header=None, engine="openpyxl")
         except Exception:
-            pass
+            continue
+
+        # Try each row as header until we find columns for material and yield
+        nrows = min(len(raw), 200)
+        for header_row in range(0, min(50, nrows)):
+            df = pd.read_excel(xls, sheet_name=sn, header=header_row, engine="openpyxl")
+            # Drop empty columns
+            df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed", na=False)]
+
+            cols = [str(c) for c in df.columns]
+            mat_idx = _first_match_idx(cols, [r"\bmaterial\b", r"\bbolt\s*material\b"])
+            yld_idx = _first_match_idx(cols, [r"\byield\b", r"\bsy\b", r"0\.?2%\s*proof", r"\bproof\b"])
+
+            if mat_idx is None or yld_idx is None:
+                continue
+
+            material_col = df.columns[mat_idx]
+            yield_col = df.columns[yld_idx]
+
+            # optional "size" column (B7 small/large, etc.)
+            size_idx = _first_match_idx(cols, [r"\bsize\b", r"\bdiam(eter)?\b", r"\bclass\b"])
+            size_col = df.columns[size_idx] if size_idx is not None else None
+
+            # Clean and collect
+            for _, row in df.iterrows():
+                mat = row.get(material_col)
+                yv = row.get(yield_col)
+                if pd.isna(mat) or pd.isna(yv):
+                    continue
+                y_ksi = _coerce_yield_to_ksi(yv)
+                if y_ksi is None or y_ksi <= 0:
+                    continue
+                size_rule = (str(row.get(size_col)).strip() if size_col else "")
+                recs.append((str(mat).strip(), size_rule, float(y_ksi)))
+
+            # If we found any, stop scanning this sheet
+            if recs:
+                break
+
+        # If we found any, stop scanning other sheets
+        if recs:
+            break
+
     if not recs:
         raise RuntimeError("No material records found.")
-    return pd.DataFrame(recs, columns=["material","size_rule","yield_ksi"]).drop_duplicates()
+
+    out = (pd.DataFrame(recs, columns=["material", "size_rule", "yield_ksi"])
+           .dropna(subset=["material", "yield_ksi"])
+           .drop_duplicates())
+
+    # If duplicates per material, keep the median yield (some sheets list multiple sizes)
+    out = (out.groupby(["material"], as_index=False)
+              .agg({"size_rule": "first", "yield_ksi": "median"}))
+
+    return out
 
 def _extract_lubricants(xls: pd.ExcelFile) -> pd.DataFrame:
     sn = _find_sheet_containing(xls, "Lubricant")
